@@ -48,6 +48,18 @@ function json(res, status, payload) {
   res.end(data);
 }
 
+async function resolveSavedlyStream(id) {
+  const response = await fetch(`https://savedly.net/f/${id}`, {
+    headers: { 'User-Agent': 'WatchTogether/1.0' },
+  });
+  if (!response.ok) throw new Error(`Could not open the Savedly file (${response.status}).`);
+  const html = await response.text();
+  const streamMatch = html.match(/\/api\/stream\/[^\"'<>\s]+/i);
+  if (!streamMatch) throw new Error('Could not resolve the Savedly video stream.');
+  const streamUrl = streamMatch[0];
+  return streamUrl.startsWith('http') ? streamUrl : `https://savedly.net${streamUrl}`;
+}
+
 async function resolveVideoUrl(inputUrl) {
   const url = String(inputUrl || '').trim();
   if (!/^https?:\/\//i.test(url)) throw new Error('Use an http(s) video URL.');
@@ -62,13 +74,8 @@ async function resolveVideoUrl(inputUrl) {
   }
   const savedly = url.match(/^https?:\/\/(?:www\.)?savedly\.net\/f\/([A-Za-z0-9]+)/i);
   if (savedly) {
-    const response = await fetch(url);
-    if (!response.ok) throw new Error(`Could not open the Savedly file (${response.status}).`);
-    const html = await response.text();
-    const streamMatch = html.match(/\/api\/stream\/[^"'<>\s]+/i);
-    if (!streamMatch) throw new Error('Could not resolve the Savedly video stream.');
-    const streamUrl = streamMatch[0];
-    return { url: streamUrl.startsWith('http') ? streamUrl : `https://savedly.net${streamUrl}`, provider: 'savedly' };
+    await resolveSavedlyStream(savedly[1]);
+    return { url: `/media/savedly/${savedly[1]}`, provider: 'savedly' };
   }
   const drive = url.match(/^https?:\/\/drive\.google\.com\/file\/d\/([A-Za-z0-9_-]+)/i) || url.match(/^https?:\/\/drive\.google\.com\/open\?id=([A-Za-z0-9_-]+)/i);
   if (drive) return { url: `https://drive.google.com/uc?export=download&id=${drive[1]}`, provider: 'google_drive' };
@@ -342,6 +349,36 @@ async function main() {
     const pathname = u.pathname;
 
     try {
+      if (req.method === 'GET' && pathname.match(/^\/media\/savedly\/[A-Za-z0-9]+$/)) {
+        const id = pathname.split('/').pop();
+        const streamUrl = await resolveSavedlyStream(id);
+        const headers = {
+          'User-Agent': 'Mozilla/5.0',
+          'Referer': 'https://savedly.net/',
+          'Accept': '*/*',
+        };
+        if (req.headers.range) headers.Range = req.headers.range;
+        const upstream = await fetch(streamUrl, { headers });
+        if (!upstream.ok && upstream.status !== 206) {
+          return json(res, upstream.status, { error: `Savedly stream returned ${upstream.status}` });
+        }
+        const responseHeaders = {
+          'Content-Type': upstream.headers.get('content-type') || 'video/x-matroska',
+          'Accept-Ranges': upstream.headers.get('accept-ranges') || 'bytes',
+          'Cache-Control': 'no-store',
+        };
+        for (const name of ['content-length', 'content-range', 'etag', 'last-modified']) {
+          const value = upstream.headers.get(name);
+          if (value) responseHeaders[name] = value;
+        }
+        res.writeHead(upstream.status, responseHeaders);
+        if (upstream.body) {
+          for await (const chunk of upstream.body) res.write(chunk);
+        }
+        res.end();
+        return;
+      }
+
       if (req.method === 'POST' && pathname === '/api/rooms') {
         const room = createRoomInMemory();
         await refreshVideoSource(room);
