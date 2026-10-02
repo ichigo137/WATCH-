@@ -13,7 +13,7 @@ const publicDir = path.join(__dirname, 'public');
 const PORT = Number(process.env.PORT || 3000);
 const ROOM_TTL_MS = 30 * 60 * 1000;
 const ROOM_DB_TTL_MS = 24 * 60 * 60 * 1000;
-const DEFAULT_VIDEO_SOURCE_URL = 'https://drive.google.com/file/d/1iQDkkTydg9chNdEj82nPp_lx7aargibU/view?usp=sharing';
+const DEFAULT_VIDEO_SOURCE_URL = 'https://savedly.net/f/5xky73v6';
 const rooms = new Map();
 
 const pool = process.env.DATABASE_URL
@@ -59,6 +59,16 @@ async function resolveVideoUrl(inputUrl) {
     const location = response.headers.get('location');
     if (!location) throw new Error('Could not resolve the Streamable video.');
     return { url: location.startsWith('//') ? `https:${location}` : location, provider: 'streamable' };
+  }
+  const savedly = url.match(/^https?:\/\/(?:www\.)?savedly\.net\/f\/([A-Za-z0-9]+)/i);
+  if (savedly) {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`Could not open the Savedly file (${response.status}).`);
+    const html = await response.text();
+    const streamMatch = html.match(/\/api\/stream\/[^"'<>\s]+/i);
+    if (!streamMatch) throw new Error('Could not resolve the Savedly video stream.');
+    const streamUrl = streamMatch[0];
+    return { url: streamUrl.startsWith('http') ? streamUrl : `https://savedly.net${streamUrl}`, provider: 'savedly' };
   }
   const drive = url.match(/^https?:\/\/drive\.google\.com\/file\/d\/([A-Za-z0-9_-]+)/i) || url.match(/^https?:\/\/drive\.google\.com\/open\?id=([A-Za-z0-9_-]+)/i);
   if (drive) return { url: `https://drive.google.com/uc?export=download&id=${drive[1]}`, provider: 'google_drive' };
@@ -274,7 +284,7 @@ function emitState(room) {
 }
 
 async function refreshVideoSource(room) {
-  if (!room.videoSourceUrl || room.videoProvider !== 'streamable') return false;
+  if (!room.videoSourceUrl || !['streamable', 'savedly'].includes(room.videoProvider)) return false;
   try {
     const resolved = await resolveVideoUrl(room.videoSourceUrl);
     if (resolved.url !== room.videoUrl) {
@@ -283,7 +293,7 @@ async function refreshVideoSource(room) {
       return true;
     }
   } catch (error) {
-    console.error('Streamable refresh failed:', error.message);
+    console.error(`${room.videoProvider} refresh failed:`, error.message);
   }
   return false;
 }
