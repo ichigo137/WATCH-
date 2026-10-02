@@ -13,6 +13,7 @@ const publicDir = path.join(__dirname, 'public');
 const PORT = Number(process.env.PORT || 3000);
 const ROOM_TTL_MS = 30 * 60 * 1000;
 const ROOM_DB_TTL_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_VIDEO_SOURCE_URL = 'https://streamable.com/atfl7e';
 const rooms = new Map();
 
 const pool = process.env.DATABASE_URL
@@ -101,6 +102,8 @@ function publicRoom(room) {
     hostId: room.hostId,
     allowControl: room.allowControl,
     videoUrl: room.videoUrl,
+    videoSourceUrl: room.videoSourceUrl,
+    videoProvider: room.videoProvider,
     videoTitle: room.videoTitle,
     playing: room.playing,
     position: Math.max(0, currentPosition(room)),
@@ -124,7 +127,9 @@ function createRoomInMemory(token = makeToken()) {
     hostId: null,
     allowControl: false,
     videoUrl: '',
-    videoTitle: 'No video selected',
+    videoSourceUrl: DEFAULT_VIDEO_SOURCE_URL,
+    videoProvider: 'streamable',
+    videoTitle: 'WatchTogether demo video',
     playing: false,
     position: 0,
     updatedAt: timestamp,
@@ -154,6 +159,8 @@ async function ensureSchema() {
       host_id TEXT,
       allow_control BOOLEAN NOT NULL DEFAULT FALSE,
       video_url TEXT NOT NULL DEFAULT '',
+      video_source_url TEXT NOT NULL DEFAULT '',
+      video_provider TEXT NOT NULL DEFAULT 'direct',
       video_title TEXT NOT NULL DEFAULT 'No video selected',
       playing BOOLEAN NOT NULL DEFAULT FALSE,
       position DOUBLE PRECISION NOT NULL DEFAULT 0,
@@ -168,19 +175,23 @@ async function ensureSchema() {
       at BIGINT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS wt_messages_room_idx ON wt_messages(room_token, at DESC);
+    ALTER TABLE wt_rooms ADD COLUMN IF NOT EXISTS video_source_url TEXT NOT NULL DEFAULT '';
+    ALTER TABLE wt_rooms ADD COLUMN IF NOT EXISTS video_provider TEXT NOT NULL DEFAULT 'direct';
   `);
   console.log('PostgreSQL persistence enabled.');
 }
 
 async function persistRoom(room) {
   await dbQuery(
-    `INSERT INTO wt_rooms (token, created_at, last_active, host_id, allow_control, video_url, video_title, playing, position, updated_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+    `INSERT INTO wt_rooms (token, created_at, last_active, host_id, allow_control, video_url, video_source_url, video_provider, video_title, playing, position, updated_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
      ON CONFLICT (token) DO UPDATE SET
        last_active=EXCLUDED.last_active,
        host_id=EXCLUDED.host_id,
        allow_control=EXCLUDED.allow_control,
        video_url=EXCLUDED.video_url,
+       video_source_url=EXCLUDED.video_source_url,
+       video_provider=EXCLUDED.video_provider,
        video_title=EXCLUDED.video_title,
        playing=EXCLUDED.playing,
        position=EXCLUDED.position,
@@ -192,6 +203,8 @@ async function persistRoom(room) {
       room.hostId,
       room.allowControl,
       room.videoUrl,
+      room.videoSourceUrl,
+      room.videoProvider,
       room.videoTitle,
       room.playing,
       room.position,
@@ -223,6 +236,8 @@ async function loadRoom(token) {
   room.hostId = row.host_id;
   room.allowControl = Boolean(row.allow_control);
   room.videoUrl = row.video_url || '';
+  room.videoSourceUrl = row.video_source_url || row.video_url || '';
+  room.videoProvider = row.video_provider || 'direct';
   room.videoTitle = row.video_title || 'No video selected';
   room.playing = Boolean(row.playing);
   room.position = Number(row.position) || 0;
@@ -252,6 +267,21 @@ function emit(room, event, data) {
 
 function emitState(room) {
   emit(room, 'state', publicRoom(room));
+}
+
+async function refreshVideoSource(room) {
+  if (!room.videoSourceUrl || room.videoProvider !== 'streamable') return false;
+  try {
+    const resolved = await resolveVideoUrl(room.videoSourceUrl);
+    if (resolved.url !== room.videoUrl) {
+      room.videoUrl = resolved.url;
+      await persistRoom(room);
+      return true;
+    }
+  } catch (error) {
+    console.error('Streamable refresh failed:', error.message);
+  }
+  return false;
 }
 
 function canControl(room, id) {
@@ -300,6 +330,7 @@ async function main() {
     try {
       if (req.method === 'POST' && pathname === '/api/rooms') {
         const room = createRoomInMemory();
+        await refreshVideoSource(room);
         await persistRoom(room);
         return json(res, 201, { token: room.token });
       }
@@ -309,6 +340,7 @@ async function main() {
         const room = await loadRoom(token);
         if (!room) return json(res, 404, { error: 'Room not found' });
         touch(room);
+        await refreshVideoSource(room);
         await persistRoom(room);
         return json(res, 200, publicRoom(room));
       }
@@ -318,6 +350,7 @@ async function main() {
         const clientId = String(u.searchParams.get('clientId') || '');
         const room = await loadRoom(token);
         if (!room || !clientId) return json(res, 404, { error: 'Room not found' });
+        await refreshVideoSource(room);
 
         res.writeHead(200, {
           'Content-Type': 'text/event-stream; charset=utf-8',
@@ -394,7 +427,7 @@ async function main() {
 
         if (body.type === 'set_video') {
           if (!canControl(room, clientId)) return json(res, 403, { error: 'Playback control not allowed' });
-          const url = String(body.url || '').trim();
+          const url = String(body.url || '').trim() || DEFAULT_VIDEO_SOURCE_URL;
           let resolved;
           try {
             resolved = await resolveVideoUrl(url);
@@ -402,6 +435,8 @@ async function main() {
             return json(res, 400, { error: error.message || 'Could not resolve video URL.' });
           }
           room.videoUrl = resolved.url.slice(0, 4000);
+          room.videoSourceUrl = url.slice(0, 4000);
+          room.videoProvider = resolved.provider;
           room.videoTitle = String(body.title || '').trim().slice(0, 120) || (resolved.provider === 'streamable' ? 'Streamable video' : 'Video');
           room.playing = false;
           room.position = 0;
