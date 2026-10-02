@@ -8,6 +8,8 @@ let activeTab = 'chat';
 let suppressPlaybackEvent = false;
 let localObjectUrl = '';
 let hlsInstance = null;
+let reconnectTimer = null;
+let reconnecting = false;
 
 const escapeHtml = (s) => String(s).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
 const formatTime = (sec) => {
@@ -121,8 +123,17 @@ function renderRoomShell() {
   </div>`);
 
   document.querySelectorAll('.tab').forEach(btn => btn.onclick = () => { activeTab = btn.dataset.tab; renderSide(); });
-  document.querySelector('#copyInvite').onclick = async () => { const link = `${location.origin}/?room=${currentToken}`; await navigator.clipboard?.writeText(link); toast('Invite link copied.'); };
-  document.querySelector('#leaveRoom').onclick = () => { trySend({type:'leave'}); eventSource?.close(); history.pushState({}, '', '/'); landing(); };
+  document.querySelector('#copyInvite').onclick = async () => {
+    const link = `${location.origin}/?room=${currentToken}`;
+    try {
+      if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(link);
+      else throw new Error();
+      toast('Invite link copied.');
+    } catch {
+      window.prompt('Copy this invite link:', link);
+    }
+  };
+  document.querySelector('#leaveRoom').onclick = async () => { await trySend({type:'leave'}); eventSource?.close(); eventSource = null; history.pushState({}, '', '/'); landing(); };
   document.querySelector('#chatForm').onsubmit = e => { e.preventDefault(); const input = document.querySelector('#chatText'); const text = input.value.trim(); if (!text) return; trySend({type:'chat', text}); input.value=''; };
   document.querySelector('#loadUrl').onclick = () => { const url = document.querySelector('#videoUrl').value.trim(); if (!url) return toast('Paste a direct video URL.'); trySend({type:'set_video', url, title: url.split('/').pop()?.split('?')[0] || 'Video'}); };
   document.querySelector('#pickFile').onclick = () => document.querySelector('#fileInput').click();
@@ -131,23 +142,28 @@ function renderRoomShell() {
     if (localObjectUrl) URL.revokeObjectURL(localObjectUrl);
     localObjectUrl = URL.createObjectURL(file);
     setVideoElement(localObjectUrl, file.name);
+    document.querySelector('#video').dataset.local = '1';
     toast('Local preview loaded only on this device.');
   };
   document.querySelector('#allowControl').onchange = e => trySend({type:'set_control', allowControl:e.target.checked});
 
   const video = document.querySelector('#video');
-  video.addEventListener('loadedmetadata', updateTime);
+  video.addEventListener('loadedmetadata', () => {
+    updateTime();
+    selectPreferredAudio(video);
+  });
+  video.addEventListener('error', () => {
+    if (video.dataset.local === '1') return;
+    document.querySelector('#emptyVideo').classList.remove('hidden');
+    toast('The video could not be decoded or the stream is unavailable.');
+  });
   video.addEventListener('timeupdate', updateTime);
   video.addEventListener('play', () => {
-    if (suppressPlaybackEvent || !state || !canControlLocal()) return;
+    if (suppressPlaybackEvent || !state || video.dataset.local === '1' || !canControlLocal()) return;
     trySend({type:'playback', action:'play', position:video.currentTime});
   });
   video.addEventListener('pause', () => {
-    if (suppressPlaybackEvent || !state || !canControlLocal()) return;
-    trySend({type:'playback', action:'pause', position:video.currentTime});
-  });
-  video.addEventListener('seeking', () => {
-    if (suppressPlaybackEvent || !state || !canControlLocal()) return;
+    if (suppressPlaybackEvent || !state || video.dataset.local === '1' || !canControlLocal()) return;
     trySend({type:'playback', action:'pause', position:video.currentTime});
   });
   document.querySelector('#playPause').onclick = () => togglePlay();
@@ -166,40 +182,68 @@ function renderRoomShell() {
 }
 
 async function connect() {
-  clientId = localStorage.getItem('wt-client-id') || crypto.randomUUID();
-  localStorage.setItem('wt-client-id', clientId);
+  clientId = sessionStorage.getItem('wt-client-id') || crypto.randomUUID();
+  sessionStorage.setItem('wt-client-id', clientId);
   setConnection('Connecting');
+  eventSource?.close();
   try {
-    const probe = await fetch(`/api/rooms/${encodeURIComponent(currentToken)}`);
+    const roomUrl = `/api/rooms/${encodeURIComponent(currentToken)}`;
+    const probe = await fetch(roomUrl, { cache: 'no-store' });
     if (!probe.ok) throw new Error('Room not found');
-    eventSource?.close();
+
+    const joinResponse = await fetch(`${roomUrl}/join`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ clientId, name: userName || 'Guest' }),
+    });
+    const data = await joinResponse.json().catch(() => ({}));
+    if (!joinResponse.ok) throw new Error(data.error || 'Could not join');
+    clientId = data.clientId;
+    sessionStorage.setItem('wt-client-id', clientId);
+    applyRoom(data.room);
+
     eventSource = new EventSource(`/events?token=${encodeURIComponent(currentToken)}&clientId=${encodeURIComponent(clientId)}`);
     eventSource.addEventListener('state', e => { try { applyRoom(JSON.parse(e.data)); } catch {} });
-    eventSource.addEventListener('chat', e => { try { const message=JSON.parse(e.data); state?.messages?.push(message); renderChat(); } catch {} });
-    eventSource.onopen = async () => {
-      setConnection('Connected');
+    eventSource.addEventListener('chat', e => {
       try {
-        const r = await fetch(`/api/rooms/${encodeURIComponent(currentToken)}/join`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({clientId,name:userName||'Guest'})});
-        const data = await r.json();
-        if (!r.ok) throw new Error(data.error || 'Could not join');
-        clientId = data.clientId;
-        localStorage.setItem('wt-client-id', clientId);
-        applyRoom(data.room);
-      } catch (err) { toast(err.message || 'Could not join room.'); }
+        const message = JSON.parse(e.data);
+        if (!state) return;
+        state.messages = [...(state.messages || []), message].slice(-100);
+        renderChat();
+      } catch {}
+    });
+    eventSource.onopen = () => {
+      reconnecting = false;
+      clearTimeout(reconnectTimer);
+      setConnection('Connected');
     };
-    eventSource.onerror = () => setConnection('Reconnecting…');
-  } catch {
+    eventSource.onerror = () => {
+      if (reconnecting) return;
+      reconnecting = true;
+      setConnection('Reconnecting…');
+      eventSource?.close();
+      eventSource = null;
+      clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(() => {
+        reconnecting = false;
+        if (currentToken) connect();
+      }, 1500);
+    };
+  } catch (err) {
+    eventSource?.close();
+    eventSource = null;
     setConnection('Connection error');
-    toast('Room not found or server unavailable.');
+    toast(err.message || 'Room not found or server unavailable.');
   }
 }
 
 async function trySend(msg) {
-  if (!currentToken || !clientId) return;
+  if (!currentToken || !clientId) return false;
   try {
     const r = await fetch(`/api/rooms/${encodeURIComponent(currentToken)}/action`, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...msg,clientId})});
-    if (!r.ok) { const d=await r.json().catch(()=>({})); if(d.error) toast(d.error); }
-  } catch { toast('Connection lost.'); }
+    if (!r.ok) { const d=await r.json().catch(()=>({})); if(d.error) toast(d.error); return false; }
+    return true;
+  } catch { toast('Connection lost.'); return false; }
 }
 
 function setConnection(text) { const el=document.querySelector('#connectionStatus'); if(el) el.textContent=text; }
@@ -250,6 +294,20 @@ function renderSide() {
   document.querySelector('#memberPanel').classList.toggle('hidden', activeTab!=='members');
   document.querySelector('#chatForm').classList.toggle('hidden', activeTab!=='chat');
 }
+function selectPreferredAudio(video) {
+  const tracks = video?.audioTracks;
+  if (!tracks?.length) return false;
+  let foundHindi = false;
+  for (const track of tracks) {
+    const language = String(track.language || '').toLowerCase();
+    const label = String(track.label || '').toLowerCase();
+    const hindi = /^(hin|hi)([-_]|$)/.test(language) || /(^|[^a-z])hindi([^a-z]|$)/.test(label);
+    track.enabled = hindi;
+    foundHindi ||= hindi;
+  }
+  return foundHindi;
+}
+
 function setVideoElement(url, title, autoplayState = true) {
   const video=document.querySelector('#video'); if(!video) return;
   if (hlsInstance) { try { hlsInstance.destroy(); } catch {} hlsInstance = null; }
@@ -257,6 +315,7 @@ function setVideoElement(url, title, autoplayState = true) {
   video.removeAttribute('src');
   video.load();
   video.dataset.url=url;
+  video.dataset.local = url.startsWith('blob:') ? '1' : '0';
   const isHls = /\.m3u8(?:$|[?#])/i.test(url);
   if (isHls && window.Hls && window.Hls.isSupported()) {
     hlsInstance = new window.Hls({ enableWorker: true, lowLatencyMode: true });

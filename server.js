@@ -14,10 +14,8 @@ const PORT = Number(process.env.PORT || 3000);
 const ROOM_TTL_MS = 30 * 60 * 1000;
 const ROOM_DB_TTL_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_VIDEO_SOURCE_URL = 'https://savedly.net/f/5xky73v6';
-const SAVEDLY_DEFAULT_ID = '5xky73v6';
-const SAVEDLY_PATCH_INSERT_AT = 4624;
-const SAVEDLY_PATCH_SIZE_DELTA = 3;
-const SAVEDLY_ORIGINAL_LENGTH = 1325337640;
+const SAVEDLY_CACHE_TTL_MS = 60_000;
+const savedlyStreamCache = new Map();
 const rooms = new Map();
 
 const pool = process.env.DATABASE_URL
@@ -103,35 +101,21 @@ function readEbmlElements(buffer, start, end, callback) {
   }
 }
 
-function encodeEbmlSize(value, length) {
-  const max = 2 ** (7 * length) - 2;
-  if (value < 0 || value > max) return null;
-  const out = Buffer.alloc(length);
-  let n = value;
-  for (let i = length - 1; i >= 0; i -= 1) {
-    out[i] = n & 0xff;
-    n = Math.floor(n / 256);
-  }
-  out[0] |= 1 << (8 - length);
-  return out;
-}
-
-function patchSavedlyHindiDefault(buffer) {
+function findSavedlyHindiAudioPatch(buffer) {
   let tracksStart = -1;
   let tracksEnd = -1;
   let tracksMeta = null;
-  readEbmlElements(buffer, 0, buffer.length, (id, dataStart, dataEnd, meta) => {
-    if (id === 0x18538067 && tracksStart < 0) {
-      readEbmlElements(buffer, dataStart, dataEnd, (childId, childStart, childEnd, childMeta) => {
-        if (childId === 0x1654AE6B && tracksStart < 0) {
-          tracksStart = childStart;
-          tracksEnd = childEnd;
-          tracksMeta = childMeta;
-        }
-      });
-    }
+  readEbmlElements(buffer, 0, buffer.length, (id, dataStart, dataEnd) => {
+    if (id !== 0x18538067 || tracksStart >= 0) return;
+    readEbmlElements(buffer, dataStart, dataEnd, (childId, childStart, childEnd, childMeta) => {
+      if (childId === 0x1654AE6B && tracksStart < 0) {
+        tracksStart = childStart;
+        tracksEnd = childEnd;
+        tracksMeta = childMeta;
+      }
+    });
   });
-  if (tracksStart < 0) return { buffer, changed: false };
+  if (tracksStart < 0) return null;
 
   const audioTracks = [];
   readEbmlElements(buffer, tracksStart, tracksEnd, (id, dataStart, dataEnd, meta) => {
@@ -141,7 +125,7 @@ function patchSavedlyHindiDefault(buffer) {
     let name = '';
     let defaultFlag = null;
     readEbmlElements(buffer, dataStart, dataEnd, (childId, childStart, childEnd) => {
-      if (childId === 0x83 && childEnd > childStart) type = buffer[childStart + 0];
+      if (childId === 0x83 && childEnd > childStart) type = buffer[childStart];
       if (childId === 0x22B59C || childId === 0x22B59D) language = buffer.subarray(childStart, childEnd).toString('utf8').toLowerCase();
       if (childId === 0x536E) name = buffer.subarray(childStart, childEnd).toString('utf8').toLowerCase();
       if (childId === 0x88 && childEnd > childStart) defaultFlag = { offset: childStart, length: childEnd - childStart };
@@ -150,57 +134,41 @@ function patchSavedlyHindiDefault(buffer) {
   });
 
   const hindi = audioTracks.find(track => /^(hin|hi)([-_]|$)/i.test(track.language) || /(^|[^a-z])hindi([^a-z]|$)/i.test(track.name));
-  if (!hindi) return { buffer, changed: false };
+  if (!hindi) return null;
 
-  const missingDefault = audioTracks.find(track => !track.defaultFlag && track !== hindi);
-  let patched = Buffer.from(buffer);
-  let insertionOffset = -1;
-  if (missingDefault) {
-    const trackSize = encodeEbmlSize(missingDefault.meta.sizeValue + 3, missingDefault.meta.sizeLength);
-    const tracksSize = encodeEbmlSize(tracksMeta.sizeValue + 3, tracksMeta.sizeLength);
-    if (!trackSize || !tracksSize) return { buffer, changed: false };
-    patched = Buffer.concat([
-      patched.subarray(0, missingDefault.dataEnd),
-      Buffer.from([0x88, 0x81, 0x00]),
-      patched.subarray(missingDefault.dataEnd),
-    ]);
-    patched.set(trackSize, missingDefault.meta.sizeOffset);
-    patched.set(tracksSize, tracksMeta.sizeOffset);
-    insertionOffset = missingDefault.dataEnd;
-  }
-
-  for (const track of audioTracks) {
-    if (!track.defaultFlag) continue;
-    const offset = track.defaultFlag.offset + (insertionOffset >= 0 && track.defaultFlag.offset >= insertionOffset ? 3 : 0);
-    patched[offset + track.defaultFlag.length - 1] = track === hindi ? 1 : 0;
-  }
-  return { buffer: patched, changed: true };
+  return {
+    flags: audioTracks.filter(track => track.defaultFlag).map(track => ({ offset: track.defaultFlag.offset, length: track.defaultFlag.length, value: track === hindi ? 1 : 0 })),
+  };
 }
 
-async function resolveSavedlyStream(id) {
-  const response = await fetch(`https://savedly.net/f/${id}`, {
-    headers: { 'User-Agent': 'WatchTogether/1.0' },
-  });
-  if (!response.ok) throw new Error(`Could not open the Savedly file (${response.status}).`);
-  const html = await response.text();
-  const streamMatch = html.match(/\/api\/stream\/[^\"'<>\s]+/i);
-  if (!streamMatch) throw new Error('Could not resolve the Savedly video stream.');
-  const streamUrl = streamMatch[0];
-  return streamUrl.startsWith('http') ? streamUrl : `https://savedly.net${streamUrl}`;
+async function resolveSavedlyStream(id, { force = false } = {}) {
+  const key = String(id);
+  const cached = savedlyStreamCache.get(key);
+  if (!force && cached && now() - cached.at < SAVEDLY_CACHE_TTL_MS) return cached.url;
+  const streamUrl = `https://cdn.savedly.net/${encodeURIComponent(key)}`;
+  savedlyStreamCache.set(key, { url: streamUrl, at: now() });
+  return streamUrl;
 }
 
-async function getSavedlyHindiPrefix(id, streamUrl) {
-  const cached = savedlyAudioPrefixCache.get(id);
+const savedlyAudioPatchCache = new Map();
+
+async function getSavedlyAudioPatch(id, streamUrl) {
+  const key = String(id);
+  const cached = savedlyAudioPatchCache.get(key);
   if (cached) return cached;
-  const upstream = await fetch(streamUrl, {
+  const response = await fetch(streamUrl, {
     headers: { 'User-Agent': 'Mozilla/5.0', Referer: 'https://savedly.net/', Range: 'bytes=0-2097151' },
+    signal: AbortSignal.timeout(15_000),
   });
-  if (!upstream.ok && upstream.status !== 206) throw new Error(`Savedly stream returned ${upstream.status}`);
-  const raw = Buffer.from(await upstream.arrayBuffer());
-  const patched = patchSavedlyHindiDefault(raw);
-  const result = { buffer: patched.buffer, changed: patched.changed };
-  savedlyAudioPrefixCache.set(id, result);
-  return result;
+  if (!response.ok && response.status !== 206) return null;
+  const prefix = Buffer.from(await response.arrayBuffer());
+  const patch = findSavedlyHindiAudioPatch(prefix);
+  savedlyAudioPatchCache.set(key, patch);
+  return patch;
+}
+
+function invalidateSavedlyStream(id) {
+  savedlyStreamCache.delete(String(id));
 }
 
 async function resolveVideoUrl(inputUrl) {
@@ -300,6 +268,7 @@ function createRoomInMemory(token = makeToken()) {
     clients: new Map(),
     messages: [],
     streams: new Map(),
+    disconnectTimers: new Map(),
   };
   rooms.set(token, room);
   return room;
@@ -494,17 +463,30 @@ async function main() {
     try {
       if (req.method === 'GET' && pathname.match(/^\/media\/savedly\/[A-Za-z0-9]+$/)) {
         const id = pathname.split('/').pop();
-        const streamUrl = await resolveSavedlyStream(id);
-        const headers = {
+        const requestHeaders = {
           'User-Agent': 'Mozilla/5.0',
           'Referer': 'https://savedly.net/',
           'Accept': '*/*',
         };
-        if (req.headers.range) headers.Range = req.headers.range;
-        const upstream = await fetch(streamUrl, { headers });
-        if (!upstream.ok && upstream.status !== 206) {
-          return json(res, upstream.status, { error: `Savedly stream returned ${upstream.status}` });
+        const requestedRange = req.headers.range?.match(/^bytes=(\d+)-(\d*)$/i);
+        if (req.headers.range) requestHeaders.Range = req.headers.range;
+
+        const controller = new AbortController();
+        res.on('close', () => controller.abort());
+
+        let upstream;
+        let streamUrl;
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          streamUrl = await resolveSavedlyStream(id, { force: attempt === 1 });
+          upstream = await fetch(streamUrl, { headers: requestHeaders, signal: controller.signal });
+          if (upstream.ok || upstream.status === 206) break;
+          if (upstream.status === 401 || upstream.status === 403 || upstream.status === 404) {
+            invalidateSavedlyStream(id);
+            savedlyAudioPatchCache.delete(String(id));
+          }
+          if (attempt === 1) return json(res, upstream.status, { error: `Savedly stream returned ${upstream.status}` });
         }
+
         const responseHeaders = {
           'Content-Type': upstream.headers.get('content-type') || 'video/x-matroska',
           'Accept-Ranges': upstream.headers.get('accept-ranges') || 'bytes',
@@ -516,7 +498,29 @@ async function main() {
         }
         res.writeHead(upstream.status, responseHeaders);
         if (upstream.body) {
-          for await (const chunk of upstream.body) res.write(chunk);
+          const contentRange = upstream.headers.get('content-range');
+          const rangeStart = contentRange
+            ? Number(contentRange.match(/^bytes (\d+)-/i)?.[1] || 0)
+            : Number(requestedRange?.[1] || 0);
+          const audioPatch = rangeStart <= 2_097_151
+            ? await getSavedlyAudioPatch(id, streamUrl).catch(() => null)
+            : null;
+          let responseOffset = rangeStart;
+          for await (const chunk of upstream.body) {
+            const body = Buffer.from(chunk);
+            if (audioPatch?.flags?.length) {
+              for (const flag of audioPatch.flags) {
+                const local = flag.offset - responseOffset;
+                if (local < body.length && local + flag.length > 0) {
+                  const start = Math.max(0, local);
+                  const end = Math.min(body.length, local + flag.length);
+                  for (let i = start; i < end; i += 1) body[i] = flag.value;
+                }
+              }
+            }
+            if (!res.write(body)) await new Promise(resolve => res.once('drain', resolve));
+            responseOffset += body.length;
+          }
         }
         res.end();
         return;
@@ -543,7 +547,8 @@ async function main() {
         const token = String(u.searchParams.get('token') || '').toUpperCase();
         const clientId = String(u.searchParams.get('clientId') || '');
         const room = await loadRoom(token);
-        if (!room || !clientId) return json(res, 404, { error: 'Room not found' });
+        if (!room) return json(res, 404, { error: 'Room not found' });
+        if (!clientId || !room.clients.has(clientId)) return json(res, 403, { error: 'Join the room before opening realtime events' });
         await refreshVideoSource(room);
 
         res.writeHead(200, {
@@ -561,15 +566,20 @@ async function main() {
         const heartbeat = setInterval(() => {
           try { res.write(': heartbeat\n\n'); } catch {}
         }, 20_000);
-        req.on('close', async () => {
+        req.on('close', () => {
           clearInterval(heartbeat);
           room.streams.delete(clientId);
-          if (room.clients.has(clientId)) {
+          const existingTimer = room.disconnectTimers.get(clientId);
+          if (existingTimer) clearTimeout(existingTimer);
+          const timer = setTimeout(async () => {
+            room.disconnectTimers.delete(clientId);
+            if (room.streams.has(clientId) || !room.clients.has(clientId)) return;
             room.clients.delete(clientId);
             if (room.hostId === clientId) room.hostId = room.clients.values().next().value?.id || null;
             touch(room);
             await saveRoomAndEmit(room);
-          }
+          }, 15_000);
+          room.disconnectTimers.set(clientId, timer);
         });
         return;
       }
@@ -631,7 +641,12 @@ async function main() {
           room.videoUrl = resolved.url.slice(0, 4000);
           room.videoSourceUrl = url.slice(0, 4000);
           room.videoProvider = resolved.provider;
-          room.videoTitle = String(body.title || '').trim().slice(0, 120) || (resolved.provider === 'streamable' ? 'Streamable video' : 'Video');
+          const defaultTitle = resolved.provider === 'streamable'
+            ? 'Streamable video'
+            : resolved.provider === 'savedly'
+              ? 'Savedly video'
+              : 'Video';
+          room.videoTitle = String(body.title || '').trim().slice(0, 120) || defaultTitle;
           room.playing = false;
           room.position = 0;
           room.updatedAt = now();
@@ -670,6 +685,11 @@ async function main() {
         }
         const id = String(body.clientId || crypto.randomUUID()).slice(0, 128);
         const name = String(body.name || 'Guest').trim().slice(0, 24) || 'Guest';
+        const disconnectTimer = room.disconnectTimers.get(id);
+        if (disconnectTimer) {
+          clearTimeout(disconnectTimer);
+          room.disconnectTimers.delete(id);
+        }
         room.clients.set(id, { id, name });
         if (!room.hostId || !room.clients.has(room.hostId)) room.hostId = id;
         touch(room);
@@ -680,8 +700,9 @@ async function main() {
       if (req.method === 'GET') {
         let filePath = pathname === '/'
           ? path.join(publicDir, 'index.html')
-          : path.join(publicDir, pathname.replace(/^\/+/, ''));
-        if (!filePath.startsWith(publicDir)) return json(res, 403, { error: 'Forbidden' });
+          : path.resolve(publicDir, pathname.replace(/^\/+/, ''));
+        const relativePath = path.relative(publicDir, filePath);
+        if (relativePath.startsWith('..') || path.isAbsolute(relativePath)) return json(res, 403, { error: 'Forbidden' });
         if (!path.extname(filePath)) filePath = path.join(publicDir, 'index.html');
         try {
           const stat = fs.statSync(filePath);
