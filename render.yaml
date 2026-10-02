@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: watchtogether
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    autoDeploy: false
+    envVars:
+      - key: DATABASE_URL
+        sync: false
