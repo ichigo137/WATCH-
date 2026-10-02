@@ -13,7 +13,7 @@ const publicDir = path.join(__dirname, 'public');
 const PORT = Number(process.env.PORT || 3000);
 const ROOM_TTL_MS = 30 * 60 * 1000;
 const ROOM_DB_TTL_MS = 24 * 60 * 60 * 1000;
-const DEFAULT_VIDEO_SOURCE_URL = 'https://streamable.com/atfl7e';
+const DEFAULT_VIDEO_SOURCE_URL = 'https://drive.google.com/file/d/1iQDkkTydg9chNdEj82nPp_lx7aargibU/view?usp=sharing';
 const rooms = new Map();
 
 const pool = process.env.DATABASE_URL
@@ -52,13 +52,17 @@ async function resolveVideoUrl(inputUrl) {
   const url = String(inputUrl || '').trim();
   if (!/^https?:\/\//i.test(url)) throw new Error('Use an http(s) video URL.');
   const streamable = url.match(/^https?:\/\/(?:www\.)?streamable\.com\/(?:e\/|t\/)?([A-Za-z0-9]+)/i);
-  if (!streamable) return { url, provider: 'direct' };
-  const shortcode = streamable[1];
-  const apiUrl = `https://api-f.streamable.com/api/v1/videos/${shortcode}/mp4`;
-  const response = await fetch(apiUrl, { method: 'HEAD', redirect: 'manual' });
-  const location = response.headers.get('location');
-  if (!location) throw new Error('Could not resolve the Streamable video.');
-  return { url: location.startsWith('//') ? `https:${location}` : location, provider: 'streamable' };
+  if (streamable) {
+    const shortcode = streamable[1];
+    const apiUrl = `https://api-f.streamable.com/api/v1/videos/${shortcode}/mp4`;
+    const response = await fetch(apiUrl, { method: 'HEAD', redirect: 'manual' });
+    const location = response.headers.get('location');
+    if (!location) throw new Error('Could not resolve the Streamable video.');
+    return { url: location.startsWith('//') ? `https:${location}` : location, provider: 'streamable' };
+  }
+  const drive = url.match(/^https?:\/\/drive\.google\.com\/file\/d\/([A-Za-z0-9_-]+)/i) || url.match(/^https?:\/\/drive\.google\.com\/open\?id=([A-Za-z0-9_-]+)/i);
+  if (drive) return { url: `https://drive.google.com/uc?export=download&id=${drive[1]}`, provider: 'google_drive' };
+  return { url, provider: 'direct' };
 }
 
 function readBody(req) {
@@ -128,8 +132,8 @@ function createRoomInMemory(token = makeToken()) {
     allowControl: false,
     videoUrl: '',
     videoSourceUrl: DEFAULT_VIDEO_SOURCE_URL,
-    videoProvider: 'streamable',
-    videoTitle: 'WatchTogether demo video',
+    videoProvider: 'google_drive',
+    videoTitle: 'WatchTogether Google Drive video',
     playing: false,
     position: 0,
     updatedAt: timestamp,
