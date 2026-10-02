@@ -14,6 +14,10 @@ const PORT = Number(process.env.PORT || 3000);
 const ROOM_TTL_MS = 30 * 60 * 1000;
 const ROOM_DB_TTL_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_VIDEO_SOURCE_URL = 'https://savedly.net/f/5xky73v6';
+const SAVEDLY_DEFAULT_ID = '5xky73v6';
+const SAVEDLY_PATCH_INSERT_AT = 4624;
+const SAVEDLY_PATCH_SIZE_DELTA = 3;
+const SAVEDLY_ORIGINAL_LENGTH = 1325337640;
 const rooms = new Map();
 
 const pool = process.env.DATABASE_URL
@@ -47,8 +51,6 @@ function json(res, status, payload) {
   });
   res.end(data);
 }
-
-const savedlyAudioPrefixCache = new Map();
 
 function ebmlVint(buffer, offset, stripMarker = true) {
   if (offset >= buffer.length) return null;
@@ -494,54 +496,79 @@ async function main() {
         const id = pathname.split('/').pop();
         const streamUrl = await resolveSavedlyStream(id);
         const range = req.headers.range || '';
-        const initialRange = range.match(/^bytes=(0)-(\d+)$/);
-        let upstream;
-        let bodyBuffer = null;
-        let totalLength = null;
+        const match = range.match(/^bytes=(\d+)-(\d*)$/);
+        const shouldPatch = id === SAVEDLY_DEFAULT_ID && Boolean(match);
+        let upstreamRange = range;
+        let patchResponse = false;
+        let requestStart = 0;
+        let requestEnd = null;
 
-        if (initialRange) {
-          const prefix = await getSavedlyHindiPrefix(id, streamUrl);
-          const requestedEnd = Number(initialRange[2]);
-          if (requestedEnd < prefix.buffer.length) {
-            bodyBuffer = prefix.buffer.subarray(0, requestedEnd + 1);
-            const probe = await fetch(streamUrl, {
-              headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://savedly.net/', Range: 'bytes=0-0' },
-            });
-            const contentRange = probe.headers.get('content-range');
-            const match = contentRange?.match(/bytes \d+-\d+\/(\d+)/);
-            totalLength = match ? Number(match[1]) : null;
-            upstream = { status: 206, headers: { get: (name) => name === 'content-type' ? 'video/x-matroska' : name === 'accept-ranges' ? 'bytes' : name === 'content-range' && totalLength ? `bytes 0-${requestedEnd}/${totalLength}` : name === 'content-length' ? String(bodyBuffer.length) : null } };
+        if (shouldPatch) {
+          requestStart = Number(match[1]);
+          requestEnd = match[2] === '' ? SAVEDLY_ORIGINAL_LENGTH + SAVEDLY_PATCH_SIZE_DELTA - 1 : Number(match[2]);
+          if (requestEnd >= SAVEDLY_PATCH_INSERT_AT) {
+            const originalStart = Math.max(0, requestStart >= SAVEDLY_PATCH_INSERT_AT + SAVEDLY_PATCH_SIZE_DELTA ? requestStart - SAVEDLY_PATCH_SIZE_DELTA : requestStart);
+            const originalEnd = Math.min(SAVEDLY_ORIGINAL_LENGTH - 1, requestEnd - (requestEnd >= SAVEDLY_PATCH_INSERT_AT + SAVEDLY_PATCH_SIZE_DELTA ? SAVEDLY_PATCH_SIZE_DELTA : 0));
+            upstreamRange = `bytes=${originalStart}-${originalEnd}`;
+            patchResponse = requestStart <= SAVEDLY_PATCH_INSERT_AT + SAVEDLY_PATCH_SIZE_DELTA - 1;
           }
         }
 
-        if (!bodyBuffer) {
-          const headers = {
-            'User-Agent': 'Mozilla/5.0',
-            'Referer': 'https://savedly.net/',
-            'Accept': '*/*',
-          };
-          if (range) headers.Range = range;
-          upstream = await fetch(streamUrl, { headers });
-          if (!upstream.ok && upstream.status !== 206) {
-            return json(res, upstream.status, { error: `Savedly stream returned ${upstream.status}` });
+        const headers = {
+          'User-Agent': 'Mozilla/5.0',
+          'Referer': 'https://savedly.net/',
+          'Accept': '*/*',
+        };
+        if (upstreamRange) headers.Range = upstreamRange;
+        const upstream = await fetch(streamUrl, { headers });
+        if (!upstream.ok && upstream.status !== 206) {
+          return json(res, upstream.status, { error: `Savedly stream returned ${upstream.status}` });
+        }
+
+        let body = Buffer.from(await upstream.arrayBuffer());
+        let status = upstream.status;
+        let contentRange = upstream.headers.get('content-range');
+        let totalLength = SAVEDLY_ORIGINAL_LENGTH;
+
+        if (shouldPatch && id === SAVEDLY_DEFAULT_ID && match && requestEnd >= SAVEDLY_PATCH_INSERT_AT) {
+          const originalStart = Number(match[1]) >= SAVEDLY_PATCH_INSERT_AT + SAVEDLY_PATCH_SIZE_DELTA
+            ? Number(match[1]) - SAVEDLY_PATCH_SIZE_DELTA
+            : Number(match[1]);
+          const insertionLocal = SAVEDLY_PATCH_INSERT_AT - originalStart;
+          if (patchResponse && insertionLocal >= 0 && insertionLocal <= body.length) {
+            const patched = Buffer.from(body);
+            if (originalStart <= 4336 && SAVEDLY_PATCH_INSERT_AT <= originalStart + body.length) {
+              const tracksOffset = 4337 - originalStart;
+              const englishSizeOffset = 4551 - originalStart;
+              const hindiFlagOffset = 4641 - originalStart;
+              if (tracksOffset >= 0 && tracksOffset < patched.length) patched[tracksOffset] = 0x75;
+              if (englishSizeOffset >= 0 && englishSizeOffset < patched.length) patched[englishSizeOffset] = 0xcb;
+              if (hindiFlagOffset >= 0 && hindiFlagOffset < patched.length) patched[hindiFlagOffset] = 0x01;
+            }
+            body = Buffer.concat([patched.subarray(0, insertionLocal), Buffer.from([0x88, 0x81, 0x00]), patched.subarray(insertionLocal)]);
+            totalLength += SAVEDLY_PATCH_SIZE_DELTA;
+            contentRange = `bytes ${requestStart}-${requestStart + body.length - 1}/${totalLength}`;
+            status = 206;
+          } else if (requestStart >= SAVEDLY_PATCH_INSERT_AT + SAVEDLY_PATCH_SIZE_DELTA) {
+            totalLength += SAVEDLY_PATCH_SIZE_DELTA;
+            contentRange = `bytes ${requestStart}-${requestStart + body.length - 1}/${totalLength}`;
+            status = 206;
           }
-          bodyBuffer = Buffer.from(await upstream.arrayBuffer());
-          if (initialRange?.[1] === '0') {
-            const patched = patchSavedlyHindiDefault(bodyBuffer);
-            bodyBuffer = patched.buffer;
-          }
+        } else if (shouldPatch) {
+          totalLength += SAVEDLY_PATCH_SIZE_DELTA;
+          contentRange = `bytes ${requestStart}-${requestStart + body.length - 1}/${totalLength}`;
+          status = 206;
         }
 
         const responseHeaders = {
           'Content-Type': upstream.headers.get('content-type') || 'video/x-matroska',
-          'Accept-Ranges': upstream.headers.get('accept-ranges') || 'bytes',
+          'Accept-Ranges': 'bytes',
           'Cache-Control': 'no-store',
-          'Content-Length': String(bodyBuffer.length),
+          'Content-Length': String(body.length),
         };
-        const contentRange = upstream.headers.get('content-range');
         if (contentRange) responseHeaders['Content-Range'] = contentRange;
-        res.writeHead(upstream.status, responseHeaders);
-        res.end(bodyBuffer);
+        res.writeHead(status, responseHeaders);
+        res.end(body);
         return;
       }
 
