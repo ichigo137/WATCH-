@@ -48,6 +48,133 @@ function json(res, status, payload) {
   res.end(data);
 }
 
+const savedlyAudioPrefixCache = new Map();
+
+function ebmlVint(buffer, offset, stripMarker = true) {
+  if (offset >= buffer.length) return null;
+  const first = buffer[offset];
+  let length = 1;
+  let mask = 0x80;
+  while (length <= 8 && !(first & mask)) {
+    length += 1;
+    mask >>= 1;
+  }
+  if (length > 8 || offset + length > buffer.length) return null;
+  let value = stripMarker ? (first & (mask - 1)) : first;
+  for (let i = 1; i < length; i += 1) value = value * 256 + buffer[offset + i];
+  return { length, value };
+}
+
+function ebmlId(buffer, offset) {
+  const first = buffer[offset];
+  let length = 1;
+  let mask = 0x80;
+  while (length <= 4 && !(first & mask)) {
+    length += 1;
+    mask >>= 1;
+  }
+  if (length > 4 || offset + length > buffer.length) return null;
+  let value = first;
+  for (let i = 1; i < length; i += 1) value = value * 256 + buffer[offset + i];
+  return { length, value };
+}
+
+function readEbmlElements(buffer, start, end, callback) {
+  let offset = start;
+  while (offset + 2 <= end) {
+    const id = ebmlId(buffer, offset);
+    if (!id) break;
+    const size = ebmlVint(buffer, offset + id.length, true);
+    if (!size) break;
+    const dataStart = offset + id.length + size.length;
+    if (dataStart > end) break;
+    const dataEnd = Math.min(end, dataStart + size.value);
+    callback(id.value, dataStart, dataEnd, {
+      idLength: id.length,
+      sizeOffset: offset + id.length,
+      sizeLength: size.length,
+      sizeValue: size.value,
+      elementStart: offset,
+    });
+    if (dataEnd <= offset) break;
+    offset = dataEnd;
+  }
+}
+
+function encodeEbmlSize(value, length) {
+  const max = 2 ** (7 * length) - 2;
+  if (value < 0 || value > max) return null;
+  const out = Buffer.alloc(length);
+  let n = value;
+  for (let i = length - 1; i >= 0; i -= 1) {
+    out[i] = n & 0xff;
+    n = Math.floor(n / 256);
+  }
+  out[0] |= 1 << (8 - length);
+  return out;
+}
+
+function patchSavedlyHindiDefault(buffer) {
+  let tracksStart = -1;
+  let tracksEnd = -1;
+  let tracksMeta = null;
+  readEbmlElements(buffer, 0, buffer.length, (id, dataStart, dataEnd, meta) => {
+    if (id === 0x18538067 && tracksStart < 0) {
+      readEbmlElements(buffer, dataStart, dataEnd, (childId, childStart, childEnd, childMeta) => {
+        if (childId === 0x1654AE6B && tracksStart < 0) {
+          tracksStart = childStart;
+          tracksEnd = childEnd;
+          tracksMeta = childMeta;
+        }
+      });
+    }
+  });
+  if (tracksStart < 0) return { buffer, changed: false };
+
+  const audioTracks = [];
+  readEbmlElements(buffer, tracksStart, tracksEnd, (id, dataStart, dataEnd, meta) => {
+    if (id !== 0xAE) return;
+    let type = null;
+    let language = '';
+    let name = '';
+    let defaultFlag = null;
+    readEbmlElements(buffer, dataStart, dataEnd, (childId, childStart, childEnd) => {
+      if (childId === 0x83 && childEnd > childStart) type = buffer[childStart + 0];
+      if (childId === 0x22B59C || childId === 0x22B59D) language = buffer.subarray(childStart, childEnd).toString('utf8').toLowerCase();
+      if (childId === 0x536E) name = buffer.subarray(childStart, childEnd).toString('utf8').toLowerCase();
+      if (childId === 0x88 && childEnd > childStart) defaultFlag = { offset: childStart, length: childEnd - childStart };
+    });
+    if (type === 2) audioTracks.push({ language, name, defaultFlag, meta, dataStart, dataEnd });
+  });
+
+  const hindi = audioTracks.find(track => /^(hin|hi)([-_]|$)/i.test(track.language) || /(^|[^a-z])hindi([^a-z]|$)/i.test(track.name));
+  if (!hindi) return { buffer, changed: false };
+
+  const missingDefault = audioTracks.find(track => !track.defaultFlag && track !== hindi);
+  let patched = Buffer.from(buffer);
+  let insertionOffset = -1;
+  if (missingDefault) {
+    const trackSize = encodeEbmlSize(missingDefault.meta.sizeValue + 3, missingDefault.meta.sizeLength);
+    const tracksSize = encodeEbmlSize(tracksMeta.sizeValue + 3, tracksMeta.sizeLength);
+    if (!trackSize || !tracksSize) return { buffer, changed: false };
+    patched = Buffer.concat([
+      patched.subarray(0, missingDefault.dataEnd),
+      Buffer.from([0x88, 0x81, 0x00]),
+      patched.subarray(missingDefault.dataEnd),
+    ]);
+    patched.set(trackSize, missingDefault.meta.sizeOffset);
+    patched.set(tracksSize, tracksMeta.sizeOffset);
+    insertionOffset = missingDefault.dataEnd;
+  }
+
+  for (const track of audioTracks) {
+    if (!track.defaultFlag) continue;
+    const offset = track.defaultFlag.offset + (insertionOffset >= 0 && track.defaultFlag.offset >= insertionOffset ? 3 : 0);
+    patched[offset + track.defaultFlag.length - 1] = track === hindi ? 1 : 0;
+  }
+  return { buffer: patched, changed: true };
+}
+
 async function resolveSavedlyStream(id) {
   const response = await fetch(`https://savedly.net/f/${id}`, {
     headers: { 'User-Agent': 'WatchTogether/1.0' },
@@ -58,6 +185,20 @@ async function resolveSavedlyStream(id) {
   if (!streamMatch) throw new Error('Could not resolve the Savedly video stream.');
   const streamUrl = streamMatch[0];
   return streamUrl.startsWith('http') ? streamUrl : `https://savedly.net${streamUrl}`;
+}
+
+async function getSavedlyHindiPrefix(id, streamUrl) {
+  const cached = savedlyAudioPrefixCache.get(id);
+  if (cached) return cached;
+  const upstream = await fetch(streamUrl, {
+    headers: { 'User-Agent': 'Mozilla/5.0', Referer: 'https://savedly.net/', Range: 'bytes=0-2097151' },
+  });
+  if (!upstream.ok && upstream.status !== 206) throw new Error(`Savedly stream returned ${upstream.status}`);
+  const raw = Buffer.from(await upstream.arrayBuffer());
+  const patched = patchSavedlyHindiDefault(raw);
+  const result = { buffer: patched.buffer, changed: patched.changed };
+  savedlyAudioPrefixCache.set(id, result);
+  return result;
 }
 
 async function resolveVideoUrl(inputUrl) {
@@ -352,30 +493,55 @@ async function main() {
       if (req.method === 'GET' && pathname.match(/^\/media\/savedly\/[A-Za-z0-9]+$/)) {
         const id = pathname.split('/').pop();
         const streamUrl = await resolveSavedlyStream(id);
-        const headers = {
-          'User-Agent': 'Mozilla/5.0',
-          'Referer': 'https://savedly.net/',
-          'Accept': '*/*',
-        };
-        if (req.headers.range) headers.Range = req.headers.range;
-        const upstream = await fetch(streamUrl, { headers });
-        if (!upstream.ok && upstream.status !== 206) {
-          return json(res, upstream.status, { error: `Savedly stream returned ${upstream.status}` });
+        const range = req.headers.range || '';
+        const initialRange = range.match(/^bytes=(0)-(\d+)$/);
+        let upstream;
+        let bodyBuffer = null;
+        let totalLength = null;
+
+        if (initialRange) {
+          const prefix = await getSavedlyHindiPrefix(id, streamUrl);
+          const requestedEnd = Number(initialRange[2]);
+          if (requestedEnd < prefix.buffer.length) {
+            bodyBuffer = prefix.buffer.subarray(0, requestedEnd + 1);
+            const probe = await fetch(streamUrl, {
+              headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://savedly.net/', Range: 'bytes=0-0' },
+            });
+            const contentRange = probe.headers.get('content-range');
+            const match = contentRange?.match(/bytes \d+-\d+\/(\d+)/);
+            totalLength = match ? Number(match[1]) : null;
+            upstream = { status: 206, headers: { get: (name) => name === 'content-type' ? 'video/x-matroska' : name === 'accept-ranges' ? 'bytes' : name === 'content-range' && totalLength ? `bytes 0-${requestedEnd}/${totalLength}` : name === 'content-length' ? String(bodyBuffer.length) : null } };
+          }
         }
+
+        if (!bodyBuffer) {
+          const headers = {
+            'User-Agent': 'Mozilla/5.0',
+            'Referer': 'https://savedly.net/',
+            'Accept': '*/*',
+          };
+          if (range) headers.Range = range;
+          upstream = await fetch(streamUrl, { headers });
+          if (!upstream.ok && upstream.status !== 206) {
+            return json(res, upstream.status, { error: `Savedly stream returned ${upstream.status}` });
+          }
+          bodyBuffer = Buffer.from(await upstream.arrayBuffer());
+          if (initialRange?.[1] === '0') {
+            const patched = patchSavedlyHindiDefault(bodyBuffer);
+            bodyBuffer = patched.buffer;
+          }
+        }
+
         const responseHeaders = {
           'Content-Type': upstream.headers.get('content-type') || 'video/x-matroska',
           'Accept-Ranges': upstream.headers.get('accept-ranges') || 'bytes',
           'Cache-Control': 'no-store',
+          'Content-Length': String(bodyBuffer.length),
         };
-        for (const name of ['content-length', 'content-range', 'etag', 'last-modified']) {
-          const value = upstream.headers.get(name);
-          if (value) responseHeaders[name] = value;
-        }
+        const contentRange = upstream.headers.get('content-range');
+        if (contentRange) responseHeaders['Content-Range'] = contentRange;
         res.writeHead(upstream.status, responseHeaders);
-        if (upstream.body) {
-          for await (const chunk of upstream.body) res.write(chunk);
-        }
-        res.end();
+        res.end(bodyBuffer);
         return;
       }
 
