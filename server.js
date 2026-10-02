@@ -495,80 +495,30 @@ async function main() {
       if (req.method === 'GET' && pathname.match(/^\/media\/savedly\/[A-Za-z0-9]+$/)) {
         const id = pathname.split('/').pop();
         const streamUrl = await resolveSavedlyStream(id);
-        const range = req.headers.range || '';
-        const match = range.match(/^bytes=(\d+)-(\d*)$/);
-        const shouldPatch = id === SAVEDLY_DEFAULT_ID && Boolean(match);
-        let upstreamRange = range;
-        let patchResponse = false;
-        let requestStart = 0;
-        let requestEnd = null;
-
-        if (shouldPatch) {
-          requestStart = Number(match[1]);
-          requestEnd = match[2] === '' ? SAVEDLY_ORIGINAL_LENGTH + SAVEDLY_PATCH_SIZE_DELTA - 1 : Number(match[2]);
-          if (requestEnd >= SAVEDLY_PATCH_INSERT_AT) {
-            const originalStart = Math.max(0, requestStart >= SAVEDLY_PATCH_INSERT_AT + SAVEDLY_PATCH_SIZE_DELTA ? requestStart - SAVEDLY_PATCH_SIZE_DELTA : requestStart);
-            const originalEnd = Math.min(SAVEDLY_ORIGINAL_LENGTH - 1, requestEnd - (requestEnd >= SAVEDLY_PATCH_INSERT_AT + SAVEDLY_PATCH_SIZE_DELTA ? SAVEDLY_PATCH_SIZE_DELTA : 0));
-            upstreamRange = `bytes=${originalStart}-${originalEnd}`;
-            patchResponse = requestStart <= SAVEDLY_PATCH_INSERT_AT + SAVEDLY_PATCH_SIZE_DELTA - 1;
-          }
-        }
-
         const headers = {
           'User-Agent': 'Mozilla/5.0',
           'Referer': 'https://savedly.net/',
           'Accept': '*/*',
         };
-        if (upstreamRange) headers.Range = upstreamRange;
+        if (req.headers.range) headers.Range = req.headers.range;
         const upstream = await fetch(streamUrl, { headers });
         if (!upstream.ok && upstream.status !== 206) {
           return json(res, upstream.status, { error: `Savedly stream returned ${upstream.status}` });
         }
-
-        let body = Buffer.from(await upstream.arrayBuffer());
-        let status = upstream.status;
-        let contentRange = upstream.headers.get('content-range');
-        let totalLength = SAVEDLY_ORIGINAL_LENGTH;
-
-        if (shouldPatch && id === SAVEDLY_DEFAULT_ID && match && requestEnd >= SAVEDLY_PATCH_INSERT_AT) {
-          const originalStart = Number(match[1]) >= SAVEDLY_PATCH_INSERT_AT + SAVEDLY_PATCH_SIZE_DELTA
-            ? Number(match[1]) - SAVEDLY_PATCH_SIZE_DELTA
-            : Number(match[1]);
-          const insertionLocal = SAVEDLY_PATCH_INSERT_AT - originalStart;
-          if (patchResponse && insertionLocal >= 0 && insertionLocal <= body.length) {
-            const patched = Buffer.from(body);
-            if (originalStart <= 4336 && SAVEDLY_PATCH_INSERT_AT <= originalStart + body.length) {
-              const tracksOffset = 4337 - originalStart;
-              const englishSizeOffset = 4551 - originalStart;
-              const hindiFlagOffset = 4641 - originalStart;
-              if (tracksOffset >= 0 && tracksOffset < patched.length) patched[tracksOffset] = 0x75;
-              if (englishSizeOffset >= 0 && englishSizeOffset < patched.length) patched[englishSizeOffset] = 0xcb;
-              if (hindiFlagOffset >= 0 && hindiFlagOffset < patched.length) patched[hindiFlagOffset] = 0x01;
-            }
-            body = Buffer.concat([patched.subarray(0, insertionLocal), Buffer.from([0x88, 0x81, 0x00]), patched.subarray(insertionLocal)]);
-            totalLength += SAVEDLY_PATCH_SIZE_DELTA;
-            contentRange = `bytes ${requestStart}-${requestStart + body.length - 1}/${totalLength}`;
-            status = 206;
-          } else if (requestStart >= SAVEDLY_PATCH_INSERT_AT + SAVEDLY_PATCH_SIZE_DELTA) {
-            totalLength += SAVEDLY_PATCH_SIZE_DELTA;
-            contentRange = `bytes ${requestStart}-${requestStart + body.length - 1}/${totalLength}`;
-            status = 206;
-          }
-        } else if (shouldPatch) {
-          totalLength += SAVEDLY_PATCH_SIZE_DELTA;
-          contentRange = `bytes ${requestStart}-${requestStart + body.length - 1}/${totalLength}`;
-          status = 206;
-        }
-
         const responseHeaders = {
           'Content-Type': upstream.headers.get('content-type') || 'video/x-matroska',
-          'Accept-Ranges': 'bytes',
+          'Accept-Ranges': upstream.headers.get('accept-ranges') || 'bytes',
           'Cache-Control': 'no-store',
-          'Content-Length': String(body.length),
         };
-        if (contentRange) responseHeaders['Content-Range'] = contentRange;
-        res.writeHead(status, responseHeaders);
-        res.end(body);
+        for (const name of ['content-length', 'content-range', 'etag', 'last-modified']) {
+          const value = upstream.headers.get(name);
+          if (value) responseHeaders[name] = value;
+        }
+        res.writeHead(upstream.status, responseHeaders);
+        if (upstream.body) {
+          for await (const chunk of upstream.body) res.write(chunk);
+        }
+        res.end();
         return;
       }
 
